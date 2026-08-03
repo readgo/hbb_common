@@ -27,6 +27,11 @@ extern "C" fn breakdown_signal_handler(sig: i32) {
         true // keep going to the next frame
     });
     let mut info = String::default();
+    // Android 不执行 GPU 驱动崩溃检测：无 nvidia/amf/mfx GPU，且崩溃堆栈符号
+    // 可能误命中关键字（如 "amf" 出现在任意符号名中）→ 误写 enable-hwcodec=N
+    // → 后续所有会话 h264 协商失败降级 VP8（21:32 实测：e 列表有 h264_mediacodec
+    // 但 usable h264=false，根因即设备配置 enable-hwcodec 被崩溃 handler 误写为 N）。
+    #[cfg(target_os = "linux")]
     if stack.iter().any(|s| {
         s.contains(&"nouveau_pushbuf_kick")
             || s.to_lowercase().contains("nvidia")
@@ -37,6 +42,7 @@ extern "C" fn breakdown_signal_handler(sig: i32) {
         info = "Always use software rendering will be set.".to_string();
         log::info!("{}", info);
     }
+    #[cfg(target_os = "linux")]
     if stack.iter().any(|s| {
         s.to_lowercase().contains("nvidia")
             || s.to_lowercase().contains("amf")
