@@ -5,7 +5,7 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     sync::atomic::{AtomicI32, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_derive::{Deserialize, Serialize};
@@ -23,6 +23,16 @@ use crate::{
 };
 
 static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
+
+/// 等待对端确认 digest（覆盖检测 / 断点续传握手）的等待时长。
+///
+/// 以前这里没有任何超时：确认包一旦丢失（对端 job 不存在时对端是静默丢弃的），
+/// 发送端就永远停在 handle_read_jobs 的 "waiting confirmation" 分支——不重发、
+/// 不报错、进度条卡在最后一格，只能等上层看门狗断开重连，重连后又重复一次。
+const DIGEST_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// digest 最多重发几次。用完仍无确认直接报错，让会话断开重试而不是干等。
+const MAX_DIGEST_RESEND: u8 = 3;
 
 pub fn get_next_job_id() -> i32 {
     NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst)
@@ -412,6 +422,10 @@ pub struct TransferJob {
     file_skipped: bool,
     file_is_waiting: bool,
     default_overwrite_strategy: Option<bool>,
+    // 等对端确认 digest 的起始时刻与已重发次数（仅供本进程使用，不序列化）
+    #[serde(skip)]
+    digest_sent_at: Option<Instant>,
+    digest_resend: u8,
     #[serde(skip_serializing)]
     digest: FileDigest,
 }
@@ -1046,6 +1060,54 @@ impl TransferJob {
 
     pub fn set_file_is_waiting(&mut self, file_is_waiting: bool) {
         self.file_is_waiting = file_is_waiting;
+        self.digest_sent_at = if file_is_waiting {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.digest_resend = 0;
+    }
+
+    /// 等对端确认 digest 是否已经超时。
+    #[inline]
+    fn digest_confirm_overdue(&self) -> bool {
+        self.file_is_waiting
+            && self
+                .digest_sent_at
+                .map(|t| t.elapsed() >= DIGEST_CONFIRM_TIMEOUT)
+                .unwrap_or(false)
+    }
+
+    /// 已重发的 digest 次数。
+    #[inline]
+    pub fn digest_resend_times(&self) -> u8 {
+        self.digest_resend
+    }
+
+    /// 重发当前文件的 digest 并重置等待计时。
+    /// 返回 false 表示已达到重发上限（调用方应当报错结束，而不是继续等）。
+    pub async fn resend_digest(&mut self, stream: &mut Stream) -> ResultType<bool> {
+        if self.digest_resend >= MAX_DIGEST_RESEND {
+            return Ok(false);
+        }
+        self.send_current_digest(stream).await?;
+        self.digest_resend += 1;
+        self.digest_sent_at = Some(Instant::now());
+        Ok(true)
+    }
+
+    /// 收尾用：先把数据 flush + 落盘，再关闭句柄，之后调用方才能安全改名。
+    ///
+    /// 以前收到 Done 时直接 `remove_job` + `modify_time()`：一没 sync（最后几 MB 可能
+    /// 还停在页缓存里），二是在句柄仍打开的状态下 rename（Windows 上必然失败），
+    /// 而 `modify_time()` 里的 rename 错误被 `.ok()` 吞掉，最终只留下 `xxx.download`。
+    pub async fn sync_and_close(&mut self) -> ResultType<()> {
+        if let Some(DataStream::FileStream(f)) = self.data_stream.as_mut() {
+            f.flush().await?;
+            f.sync_all().await?;
+        }
+        self.data_stream.take();
+        Ok(())
     }
 
     #[inline]
@@ -1367,7 +1429,24 @@ pub async fn handle_read_jobs(
                         None => stream.send(&new_done(job.id(), job.file_num())).await?,
                     }
                 } else {
-                    // waiting confirmation.
+                    // 等对端确认 digest（覆盖检测 / 断点续传握手）。
+                    // 确认包一旦丢失（对端 job 不存在时对端会静默丢弃），以前这里会永远
+                    // 静默等待——不重发、不报错，进度卡在最后一格。现在定时重发，超过
+                    // 上限直接报错，让上层断开重试。
+                    if job.digest_confirm_overdue() {
+                        if !job.resend_digest(stream).await? {
+                            bail!(
+                                "file transfer: peer did not confirm the request within {}s",
+                                DIGEST_CONFIRM_TIMEOUT.as_secs()
+                            );
+                        }
+                        log::warn!(
+                            "file transfer: digest of id {}, file_num {} not confirmed, resent ({} times)",
+                            job.id(),
+                            job.file_num(),
+                            job.digest_resend_times()
+                        );
+                    }
                 }
             }
         }
