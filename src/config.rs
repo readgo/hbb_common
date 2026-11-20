@@ -796,6 +796,17 @@ impl Config {
             std::fs::create_dir_all(&path).ok();
             return path;
         }
+        #[cfg(target_os = "windows")]
+        {
+            // 日志放用户目录 .yy_light\log：资源管理器直接可见，便于远程取证时复制；
+            // 不放 AppData（隐藏目录）。服务账户（SYSTEM）的 home 经 patch 转到
+            // ServiceProfiles\LocalService。Linux 走下方 ~/.local/share/logs 分支不变。
+            let mut path = patch(Self::get_home());
+            path.push(format!(".{}", *APP_NAME.read().unwrap()));
+            path.push("log");
+            std::fs::create_dir_all(&path).ok();
+            return path;
+        }
         if let Some(path) = Self::path("").parent() {
             let mut path: PathBuf = path.into();
             path.push("log");
